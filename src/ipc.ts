@@ -8,10 +8,12 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { sendAgentMessage, storeMemory, storeResearch } from './memory.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendVoice?: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -171,6 +173,24 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For agent_message
+    toAgent?: string;
+    threadId?: string;
+    subject?: string;
+    body?: string;
+    priority?: string;
+    // For store_memory
+    content?: string;
+    category?: string;
+    sourceType?: string;
+    // For store_research
+    topic?: string;
+    finding?: string;
+    source?: string;
+    tags?: string[];
+    // For send_voice
+    text?: string;
+    voice?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -446,6 +466,64 @@ export async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'agent_message':
+      if (data.toAgent && data.threadId && data.body) {
+        await sendAgentMessage(
+          'andy',
+          data.toAgent,
+          data.threadId,
+          data.body,
+          data.subject,
+          data.priority,
+        );
+        logger.info(
+          { fromAgent: 'andy', toAgent: data.toAgent, threadId: data.threadId },
+          'Agent message sent via IPC',
+        );
+      } else {
+        logger.warn({ data }, 'agent_message IPC missing required fields');
+      }
+      break;
+
+    case 'store_memory':
+      if (data.content) {
+        await storeMemory(data.content, data.sourceType ?? 'agent', data.category);
+        logger.info(
+          { sourceGroup, category: data.category },
+          'Memory stored via IPC',
+        );
+      } else {
+        logger.warn({ data }, 'store_memory IPC missing required content field');
+      }
+      break;
+
+    case 'store_research':
+      if (data.topic && data.finding) {
+        await storeResearch(data.topic, data.finding, data.source, data.tags);
+        logger.info(
+          { sourceGroup, topic: data.topic },
+          'Research stored via IPC',
+        );
+      } else {
+        logger.warn({ data }, 'store_research IPC missing required topic/finding fields');
+      }
+      break;
+
+    case 'send_voice':
+      if (data.chatJid && data.text && deps.sendVoice) {
+        // Authorization: non-main groups can only send voice to their own JID
+        const targetGroup = registeredGroups[data.chatJid];
+        if (!isMain && (!targetGroup || targetGroup.folder !== sourceGroup)) {
+          logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized send_voice attempt blocked');
+          break;
+        }
+        await deps.sendVoice(data.chatJid, data.text);
+        logger.info({ chatJid: data.chatJid, sourceGroup }, 'Voice message sent via IPC');
+      } else {
+        logger.warn({ data }, 'send_voice IPC missing chatJid/text or sendVoice not available');
       }
       break;
 
