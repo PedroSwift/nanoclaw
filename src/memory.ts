@@ -198,7 +198,10 @@ export async function storeMemory(
       [sourceId, content, embeddingStr, category ?? null, thinkingTier ?? null],
     );
 
-    logger.debug({ category, thinkingTier, contentLength: content.length }, 'Memory stored');
+    logger.debug(
+      { category, thinkingTier, contentLength: content.length },
+      'Memory stored',
+    );
   } catch (err) {
     logger.warn({ err }, 'storeMemory failed — skipping');
   }
@@ -224,13 +227,18 @@ export async function extractAndStoreMemories(
       : conversation;
 
   const systemPrompt = `You extract long-term memories from conversations.
-Return a JSON object with a memories array: {"memories": [{"content": "one clear sentence", "category": "decision|preference|project_note|personal|research"}]}.
+Return a JSON object: {"memories": [{"content": "one clear sentence", "category": "project_note"}]}
+
+Valid categories (pick exactly one per item): decision, preference, project_note, personal, research, problem_solved, problem
+
 Rules:
-- 3 to 7 items maximum
+- 3 to 7 items maximum, or fewer if the conversation lacks substance — it is fine to return an empty array
+- ONLY extract facts explicitly stated in the conversation. Do NOT infer, extrapolate, or generate generic software content
 - Only facts worth remembering weeks from now
 - Skip greetings, small talk, transient errors, step-by-step troubleshooting
 - Prefer decisions, preferences, project state, and personal context
-- Each item must be self-contained and make sense without the conversation`;
+- Each item must be self-contained and make sense without the conversation
+- If you are not certain a fact comes directly from the conversation text, omit it`;
 
   try {
     const res = await fetch(`${OLLAMA_URL}/api/chat`, {
@@ -278,14 +286,30 @@ Rules:
     );
     const sourceId = sourceResult.rows[0].id;
 
+    const VALID_CATEGORIES = new Set([
+      'decision', 'preference', 'project_note', 'personal', 'research',
+      'problem_solved', 'problem',
+    ]);
+
     for (const item of items) {
       if (!item.content || typeof item.content !== 'string') continue;
+      // Reject pipe-separated categories (model misread the prompt format)
+      // and anything not in the known set — fall back to null rather than
+      // polluting the category column with arbitrary strings.
+      const rawCategory = typeof item.category === 'string'
+        ? item.category.trim()
+        : null;
+      const category =
+        rawCategory && VALID_CATEGORIES.has(rawCategory) ? rawCategory : null;
+      if (rawCategory && !category) {
+        logger.warn({ rawCategory }, 'extractAndStoreMemories: invalid category rejected');
+      }
       const embedding = await embedText(item.content);
       const embeddingStr = embedding ? `[${embedding.join(',')}]` : null;
       await p.query(
         `INSERT INTO memories (source_id, content, embedding, category)
          VALUES ($1, $2, $3, $4)`,
-        [sourceId, item.content.trim(), embeddingStr, item.category ?? null],
+        [sourceId, item.content.trim(), embeddingStr, category],
       );
     }
 
@@ -328,9 +352,7 @@ export async function sendAgentMessage(
  * Fetch unread messages for an agent (including broadcasts to 'all').
  * Marks them as read.
  */
-export async function fetchUnreadMessages(
-  agentName: string,
-): Promise<
+export async function fetchUnreadMessages(agentName: string): Promise<
   Array<{
     id: string;
     from_agent: string;
@@ -379,9 +401,7 @@ export async function fetchUnreadMessages(
 /**
  * Fetch a full message thread by thread_id.
  */
-export async function fetchThread(
-  threadId: string,
-): Promise<
+export async function fetchThread(threadId: string): Promise<
   Array<{
     from_agent: string;
     to_agent: string;
