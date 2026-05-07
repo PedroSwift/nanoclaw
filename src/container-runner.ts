@@ -16,6 +16,7 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -238,6 +239,16 @@ function buildContainerArgs(
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
+  // Inject Andy's dedicated DB URL so the container can run psql queries directly.
+  // Uses a least-privilege user scoped to memories, research_log, agent_messages.
+  // host.docker.internal resolves to the host from inside the container.
+  const envConfig = readEnvFile(['SECOND_BRAIN_ANDY_DB_URL']);
+  const andyDbUrl =
+    process.env.SECOND_BRAIN_ANDY_DB_URL || envConfig.SECOND_BRAIN_ANDY_DB_URL;
+  if (andyDbUrl) {
+    args.push('-e', `SECOND_BRAIN_DB_URL=${andyDbUrl}`);
+  }
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
@@ -309,6 +320,7 @@ export async function runContainerAgent(
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     onProcess(container, containerName);
