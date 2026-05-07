@@ -13,8 +13,7 @@ import { logger } from './logger.js';
 
 const envConfig = readEnvFile(['SECOND_BRAIN_DB_URL', 'OLLAMA_URL']);
 
-const DB_URL =
-  process.env.SECOND_BRAIN_DB_URL || envConfig.SECOND_BRAIN_DB_URL;
+const DB_URL = process.env.SECOND_BRAIN_DB_URL || envConfig.SECOND_BRAIN_DB_URL;
 const OLLAMA_URL =
   process.env.OLLAMA_URL || envConfig.OLLAMA_URL || 'http://localhost:11434';
 const EMBED_MODEL = 'nomic-embed-text';
@@ -47,7 +46,10 @@ export function initMemoryDb(): void {
   p.query('SELECT 1')
     .then(() => logger.info('Second Brain Postgres connected'))
     .catch((err) =>
-      logger.warn({ err }, 'Second Brain Postgres not reachable — continuing without memory'),
+      logger.warn(
+        { err },
+        'Second Brain Postgres not reachable — continuing without memory',
+      ),
     );
 }
 
@@ -75,7 +77,14 @@ export async function fetchMemoryContext(): Promise<string> {
       p.query<{ content: string; captured_at: Date }>(
         'SELECT content, captured_at FROM memories ORDER BY captured_at DESC LIMIT 30',
       ),
-      p.query<{ id: string; from_agent: string; thread_id: string; subject: string | null; body: string; created_at: Date }>(
+      p.query<{
+        id: string;
+        from_agent: string;
+        thread_id: string;
+        subject: string | null;
+        body: string;
+        created_at: Date;
+      }>(
         `SELECT id, from_agent, thread_id, subject, body, created_at
          FROM agent_messages
          WHERE (to_agent = 'andy' OR to_agent = 'all') AND status = 'unread'
@@ -117,13 +126,18 @@ export async function fetchMemoryContext(): Promise<string> {
       for (const m of messages.rows) {
         const date = new Date(m.created_at).toLocaleDateString('en-AU');
         const subject = m.subject ? ` — ${m.subject}` : '';
-        lines.push(`**[${date}] From ${m.from_agent}${subject} (thread: ${m.thread_id})**`);
+        lines.push(
+          `**[${date}] From ${m.from_agent}${subject} (thread: ${m.thread_id})**`,
+        );
         lines.push(m.body);
         lines.push('');
       }
       // Mark them read
       const ids = messages.rows.map((m) => m.id);
-      p.query(`UPDATE agent_messages SET status = 'read', read_at = now() WHERE id = ANY($1)`, [ids]).catch(() => {});
+      p.query(
+        `UPDATE agent_messages SET status = 'read', read_at = now() WHERE id = ANY($1)`,
+        [ids],
+      ).catch(() => {});
     }
 
     lines.push('</second_brain_context>');
@@ -163,6 +177,7 @@ export async function storeMemory(
   content: string,
   sourceType: string = 'conversation',
   category?: string,
+  thinkingTier?: 'build' | 'architecture' | 'speculation',
 ): Promise<void> {
   const p = getPool();
   if (!p) return;
@@ -178,12 +193,12 @@ export async function storeMemory(
     const embeddingStr = embedding ? `[${embedding.join(',')}]` : null;
 
     await p.query(
-      `INSERT INTO memories (source_id, content, embedding, category)
-       VALUES ($1, $2, $3, $4)`,
-      [sourceId, content, embeddingStr, category ?? null],
+      `INSERT INTO memories (source_id, content, embedding, category, thinking_tier)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [sourceId, content, embeddingStr, category ?? null, thinkingTier ?? null],
     );
 
-    logger.debug({ category, contentLength: content.length }, 'Memory stored');
+    logger.debug({ category, thinkingTier, contentLength: content.length }, 'Memory stored');
   } catch (err) {
     logger.warn({ err }, 'storeMemory failed — skipping');
   }
@@ -241,15 +256,25 @@ Rules:
     let items: { content: string; category: string }[];
     try {
       const parsed = JSON.parse(raw);
-      items = Array.isArray(parsed) ? parsed : (parsed.memories ?? parsed.items ?? []);
+      items = Array.isArray(parsed)
+        ? parsed
+        : (parsed.memories ?? parsed.items ?? []);
     } catch {
-      logger.warn({ raw }, 'extractAndStoreMemories: failed to parse Ollama JSON');
+      logger.warn(
+        { raw },
+        'extractAndStoreMemories: failed to parse Ollama JSON',
+      );
       return;
     }
 
     const sourceResult = await p.query<{ id: string }>(
       'INSERT INTO sources (type, title) VALUES ($1, $2) RETURNING id',
-      [sourceType, groupName ? `${groupName} — ${new Date().toISOString()}` : new Date().toISOString()],
+      [
+        sourceType,
+        groupName
+          ? `${groupName} — ${new Date().toISOString()}`
+          : new Date().toISOString(),
+      ],
     );
     const sourceId = sourceResult.rows[0].id;
 
@@ -305,7 +330,16 @@ export async function sendAgentMessage(
  */
 export async function fetchUnreadMessages(
   agentName: string,
-): Promise<Array<{ id: string; from_agent: string; thread_id: string; subject: string | null; body: string; created_at: Date }>> {
+): Promise<
+  Array<{
+    id: string;
+    from_agent: string;
+    thread_id: string;
+    subject: string | null;
+    body: string;
+    created_at: Date;
+  }>
+> {
   const p = getPool();
   if (!p) return [];
 
@@ -347,7 +381,15 @@ export async function fetchUnreadMessages(
  */
 export async function fetchThread(
   threadId: string,
-): Promise<Array<{ from_agent: string; to_agent: string; body: string; status: string; created_at: Date }>> {
+): Promise<
+  Array<{
+    from_agent: string;
+    to_agent: string;
+    body: string;
+    status: string;
+    created_at: Date;
+  }>
+> {
   const p = getPool();
   if (!p) return [];
 

@@ -183,6 +183,7 @@ export async function processTaskIpc(
     content?: string;
     category?: string;
     sourceType?: string;
+    thinking_tier?: 'build' | 'architecture' | 'speculation';
     // For store_research
     topic?: string;
     finding?: string;
@@ -471,18 +472,58 @@ export async function processTaskIpc(
 
     case 'agent_message':
       if (data.toAgent && data.threadId && data.body) {
+        // Messages to claude_code must have priority='wake' so the watcher
+        // fires. If Andy omits priority (common), default it automatically.
+        const effectivePriority =
+          data.priority ??
+          (data.toAgent === 'claude_code' ? 'wake' : undefined);
         await sendAgentMessage(
           'andy',
           data.toAgent,
           data.threadId,
           data.body,
           data.subject,
-          data.priority,
+          effectivePriority,
         );
         logger.info(
           { fromAgent: 'andy', toAgent: data.toAgent, threadId: data.threadId },
           'Agent message sent via IPC',
         );
+        // Proactive notification: forward both sides of Andy <-> CC to Peter
+        // on Telegram so he sees all messages in real time.
+        const notifyTarget =
+          data.toAgent === 'andy'
+            ? 'andy'
+            : data.toAgent === 'claude_code'
+              ? 'claude_code'
+              : null;
+        if (notifyTarget) {
+          const mainGroup = Object.entries(registeredGroups).find(
+            ([, g]) => g.isMain,
+          );
+          if (mainGroup) {
+            const arrow =
+              notifyTarget === 'andy' ? 'CC → Andy' : 'Andy → CC';
+            const header = data.subject
+              ? `*${arrow}: ${data.subject}*
+
+`
+              : `*${arrow}:*
+
+`;
+            const MAX = 800;
+            const preview =
+              data.body.length > MAX
+                ? data.body.slice(0, MAX) +
+                  `… _(${data.body.length - MAX} chars truncated)_`
+                : data.body;
+            await deps.sendMessage(mainGroup[0], `${header}${preview}`);
+            logger.info(
+              { chatJid: mainGroup[0], arrow },
+              'Forwarded agent message to Peter via Telegram',
+            );
+          }
+        }
       } else {
         logger.warn({ data }, 'agent_message IPC missing required fields');
       }
@@ -490,13 +531,21 @@ export async function processTaskIpc(
 
     case 'store_memory':
       if (data.content) {
-        await storeMemory(data.content, data.sourceType ?? 'agent', data.category);
+        await storeMemory(
+          data.content,
+          data.sourceType ?? 'agent',
+          data.category,
+          data.thinking_tier,
+        );
         logger.info(
-          { sourceGroup, category: data.category },
+          { sourceGroup, category: data.category, thinkingTier: data.thinking_tier },
           'Memory stored via IPC',
         );
       } else {
-        logger.warn({ data }, 'store_memory IPC missing required content field');
+        logger.warn(
+          { data },
+          'store_memory IPC missing required content field',
+        );
       }
       break;
 
@@ -508,7 +557,10 @@ export async function processTaskIpc(
           'Research stored via IPC',
         );
       } else {
-        logger.warn({ data }, 'store_research IPC missing required topic/finding fields');
+        logger.warn(
+          { data },
+          'store_research IPC missing required topic/finding fields',
+        );
       }
       break;
 
@@ -517,13 +569,22 @@ export async function processTaskIpc(
         // Authorization: non-main groups can only send voice to their own JID
         const targetGroup = registeredGroups[data.chatJid];
         if (!isMain && (!targetGroup || targetGroup.folder !== sourceGroup)) {
-          logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized send_voice attempt blocked');
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized send_voice attempt blocked',
+          );
           break;
         }
         await deps.sendVoice(data.chatJid, data.text);
-        logger.info({ chatJid: data.chatJid, sourceGroup }, 'Voice message sent via IPC');
+        logger.info(
+          { chatJid: data.chatJid, sourceGroup },
+          'Voice message sent via IPC',
+        );
       } else {
-        logger.warn({ data }, 'send_voice IPC missing chatJid/text or sendVoice not available');
+        logger.warn(
+          { data },
+          'send_voice IPC missing chatJid/text or sendVoice not available',
+        );
       }
       break;
 
