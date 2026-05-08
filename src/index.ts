@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import {
   ASSISTANT_NAME,
@@ -60,15 +61,51 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import {
+  extractAndStoreMemories,
+  fetchMemoryContext,
+  fetchUnreadMessages,
+  hasUnreadWakeSignal,
+  initMemoryDb,
+  sendAgentMessage,
+} from './memory.js';
+import {
+  classifyMessage,
+  queryDeepseek,
+  Destination,
+} from './deepseek-router.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+/**
+ * Check whether the message starts with an explicit recipient prefix.
+ * Supports: "Andy: ...", "CC: ...", "CCode: ...", "Deepseek: ..."
+ * Returns the destination and the stripped message text, or null if no prefix.
+ */
+function detectExplicitAddress(
+  text: string,
+): { destination: Destination; content: string } | null {
+  const match = text.match(/^(andy|cc|ccode|deepseek)\s*:\s*/i);
+  if (!match) return null;
+  const prefix = match[1].toLowerCase();
+  const content = text.slice(match[0].length).trim();
+  if (prefix === 'andy') return { destination: 'andy', content };
+  if (prefix === 'deepseek') return { destination: 'deepseek', content };
+  return { destination: 'claude_code', content }; // cc / ccode
+}
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+// Tracks the latest timestamp of messages piped to an active container.
+// Cursor is NOT advanced at pipe time — only when the container actually produces output.
+// If the container exits without responding, the cursor stays behind so the next
+// processGroupMessages run picks up the unresponded messages.
+let pendingPipedTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+let wakeCheckRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -180,6 +217,53 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // --- Routing: classify the latest user message and redirect if needed ---
+  const latestUserMsg = missedMessages.filter((m) => !m.is_from_me).at(-1);
+  if (latestUserMsg) {
+    // Explicit address prefix bypasses LLM router (recovery path mirrors main loop)
+    const explicit = detectExplicitAddress(latestUserMsg.content);
+    const destination =
+      explicit?.destination ?? (await classifyMessage(latestUserMsg.content));
+    const contentToRoute = explicit?.content ?? latestUserMsg.content;
+
+    if (destination !== 'andy') {
+      // Advance cursor — message was handled by a non-Andy destination
+      lastAgentTimestamp[chatJid] =
+        missedMessages[missedMessages.length - 1].timestamp;
+      saveState();
+      logger.info({ group: group.name, destination }, 'Message routed');
+
+      if (destination === 'deepseek') {
+        await channel.setTyping?.(chatJid, true);
+        try {
+          const reply = await queryDeepseek(contentToRoute);
+          await channel.sendMessage(chatJid, reply);
+        } catch (err) {
+          logger.error({ err }, 'Deepseek query failed');
+          await channel.sendMessage(
+            chatJid,
+            'Deepseek unavailable — try again shortly.',
+          );
+        } finally {
+          await channel.setTyping?.(chatJid, false);
+        }
+      } else if (destination === 'claude_code') {
+        await sendAgentMessage(
+          'andy',
+          'claude_code',
+          'task-routing',
+          contentToRoute,
+          'Task from Peter',
+          'wake',
+        );
+        await channel.sendMessage(chatJid, '\u2192 Queued for CC');
+      }
+      return true;
+    }
+  }
+  // destination === 'andy': fall through to container dispatch below
+  // -----------------------------------------------------------------
+
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -211,6 +295,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  const responseParts: string[] = [];
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -225,6 +310,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
+        responseParts.push(text);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -241,6 +327,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Advance cursor for piped messages only on clean container exit — not
+  // eagerly in the streaming callback, where an output for the *previous*
+  // message would falsely advance the cursor past a piped message that the
+  // container hasn't processed yet, causing it to be silently dropped.
+  if (output !== 'error' && !hadError && pendingPipedTimestamp[chatJid]) {
+    lastAgentTimestamp[chatJid] = pendingPipedTimestamp[chatJid];
+    delete pendingPipedTimestamp[chatJid];
+    saveState();
+  }
+
+  // Safety net: if the container exited with error while a piped message was
+  // in-flight, pendingPipedTimestamp is still set. Re-enqueue so those
+  // messages are processed in the next container run.
+  if (pendingPipedTimestamp[chatJid]) {
+    logger.info(
+      { group: group.name },
+      'Container exited with unprocessed piped messages — re-queuing immediately',
+    );
+    delete pendingPipedTimestamp[chatJid];
+    queue.enqueueMessageCheck(chatJid);
+  }
+
+  // Fire-and-forget: extract key memories from this conversation after responding
+  if (output !== 'error' && !hadError && responseParts.length > 0) {
+    const fullConversation = `USER:\n${prompt}\n\nANDY:\n${responseParts.join('\n')}`;
+    extractAndStoreMemories(fullConversation, 'conversation', group.name).catch(
+      () => {},
+    );
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -273,6 +389,28 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
+
+  // Inject Second Brain memory context before the conversation prompt
+  const memoryContext = await fetchMemoryContext();
+
+  // Inject project-context.md from the group folder if present
+  let projectContext = '';
+  try {
+    const groupDir = resolveGroupFolderPath(group.folder);
+    const contextFile = path.join(groupDir, 'project-context.md');
+    if (fs.existsSync(contextFile)) {
+      const content = fs.readFileSync(contextFile, 'utf8').trim();
+      if (content) {
+        projectContext = `<project_context>\n${content}\n</project_context>`;
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+
+  const contextParts = [memoryContext, projectContext, prompt].filter(Boolean);
+  const promptWithMemory =
+    contextParts.length > 1 ? contextParts.join('\n\n') : prompt;
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -314,7 +452,7 @@ async function runAgent(
     const output = await runContainerAgent(
       group,
       {
-        prompt,
+        prompt: promptWithMemory,
         sessionId,
         groupFolder: group.folder,
         chatJid,
@@ -343,6 +481,70 @@ async function runAgent(
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
+  }
+}
+
+/**
+ * Check for unread wake-priority agent_messages addressed to Andy.
+ * If any exist and Andy has no active container, launch one with the
+ * messages as the prompt so Andy can process them without needing a
+ * Telegram trigger.
+ */
+async function checkWakeSignals(): Promise<void> {
+  if (wakeCheckRunning) return;
+
+  const mainEntry = Object.entries(registeredGroups).find(([, g]) => g.isMain);
+  if (!mainEntry) return;
+
+  const [mainJid, mainGroup] = mainEntry;
+  if (queue.hasActiveMsgContainer(mainJid)) return;
+
+  if (!(await hasUnreadWakeSignal('andy'))) return;
+
+  const unread = await fetchUnreadMessages('andy');
+  if (unread.length === 0) return;
+
+  const msgBlock = unread
+    .map((m) => {
+      const date = new Date(m.created_at).toLocaleDateString('en-AU');
+      const subject = m.subject ? ` — ${m.subject}` : '';
+      return `**[${date}] From ${m.from_agent}${subject} (thread: ${m.thread_id})**\n${m.body}`;
+    })
+    .join('\n\n');
+
+  const prompt = `<agent_messages>\n${msgBlock}\n</agent_messages>`;
+
+  logger.info({ count: unread.length }, 'Wake signal: launching Andy for unread agent messages');
+
+  wakeCheckRunning = true;
+  const channel = findChannel(channels, mainJid);
+  await channel?.setTyping?.(mainJid, true);
+
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      queue.closeStdin(mainJid);
+    }, IDLE_TIMEOUT);
+  };
+
+  try {
+    await runAgent(mainGroup, prompt, mainJid, async (result) => {
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        if (text && channel) await channel.sendMessage(mainJid, text);
+        resetIdleTimer();
+      }
+      if (result.status === 'success') queue.notifyIdle(mainJid);
+    });
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    await channel?.setTyping?.(mainJid, false);
+    wakeCheckRunning = false;
   }
 }
 
@@ -418,16 +620,124 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+
+          // --- Upstream routing: classify before queue/pipe decision ---
+          // Must run here so mid-conversation messages are intercepted even
+          // when Andy's container is already active.
+          const latestUserMsg = messagesToSend
+            .filter((m) => !m.is_from_me)
+            .at(-1);
+          if (latestUserMsg) {
+            // Explicit address prefix ("Andy: ...", "CC: ...", "Deepseek: ...")
+            // bypasses the LLM router entirely — destination is unambiguous.
+            const explicit = detectExplicitAddress(latestUserMsg.content);
+            const destination =
+              explicit?.destination ??
+              (await classifyMessage(latestUserMsg.content));
+            const contentToRoute = explicit?.content ?? latestUserMsg.content;
+
+            if (explicit) {
+              logger.info(
+                {
+                  prefix: explicit.destination,
+                  text: contentToRoute.substring(0, 60),
+                },
+                '[ROUTER] explicit address',
+              );
+            } else {
+              logger.info(
+                { text: latestUserMsg.content.substring(0, 60) },
+                '[ROUTER] classifying',
+              );
+            }
+
+            if (destination !== 'andy') {
+              lastAgentTimestamp[chatJid] =
+                messagesToSend[messagesToSend.length - 1].timestamp;
+              saveState();
+              logger.info({ group: group.name, destination }, 'Message routed');
+
+              if (destination === 'deepseek') {
+                channel
+                  .setTyping?.(chatJid, true)
+                  ?.catch((err) =>
+                    logger.warn(
+                      { chatJid, err },
+                      'Failed to set typing indicator',
+                    ),
+                  );
+                try {
+                  const reply = await queryDeepseek(contentToRoute);
+                  await channel.sendMessage(chatJid, reply);
+                } catch (err) {
+                  logger.error({ err }, 'Deepseek query failed');
+                  await channel.sendMessage(
+                    chatJid,
+                    'Deepseek unavailable — try again shortly.',
+                  );
+                } finally {
+                  channel
+                    .setTyping?.(chatJid, false)
+                    ?.catch((err) =>
+                      logger.warn(
+                        { chatJid, err },
+                        'Failed to clear typing indicator',
+                      ),
+                    );
+                }
+              } else if (destination === 'claude_code') {
+                await sendAgentMessage(
+                  'andy',
+                  'claude_code',
+                  'task-routing',
+                  contentToRoute,
+                  'Task from Peter',
+                  'wake',
+                );
+                await channel.sendMessage(chatJid, '\u2192 Queued for CC');
+              }
+              continue;
+            }
+          }
+          // destination === 'andy': fall through to queue/pipe dispatch
+          // ---------------------------------------------------------------
+
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // If a container is already active, inject any unread agent_messages
+          // mid-session — they'd otherwise only appear at next session start.
+          let formattedToSend = formatted;
+          if (queue.hasActiveMsgContainer(chatJid)) {
+            const unread = await fetchUnreadMessages('andy');
+            if (unread.length > 0) {
+              const msgBlock = unread
+                .map((m) => {
+                  const date = new Date(m.created_at).toLocaleDateString(
+                    'en-AU',
+                  );
+                  const subject = m.subject ? ` — ${m.subject}` : '';
+                  return `**[${date}] From ${m.from_agent}${subject} (thread: ${m.thread_id})**\n${m.body}`;
+                })
+                .join('\n\n');
+              formattedToSend = `<agent_messages>\n${msgBlock}\n</agent_messages>\n\n${formatted}`;
+              logger.info(
+                { chatJid, count: unread.length },
+                'Injecting unread agent_messages into active container session',
+              );
+            }
+          }
+
+          if (queue.sendMessage(chatJid, formattedToSend)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
+            // Record the piped timestamp but do NOT advance lastAgentTimestamp yet.
+            // Cursor advances only when the container actually produces output (in the
+            // processGroupMessages streaming callback). If the container exits without
+            // responding, the cursor stays behind so the next run picks up these messages.
+            pendingPipedTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)
@@ -443,6 +753,13 @@ async function startMessageLoop(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
+
+    // Wake poll: launch Andy if a wake-priority agent_message is waiting.
+    // Fire-and-forget — must not block the message loop.
+    checkWakeSignals().catch((err) =>
+      logger.warn({ err }, 'Wake signal check failed'),
+    );
+
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
   }
 }
@@ -465,15 +782,16 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
+async function ensureContainerSystemRunning(): Promise<void> {
+  await ensureContainerRuntimeRunning();
   cleanupOrphans();
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  await ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+  initMemoryDb();
   loadState();
   restoreRemoteControl();
 
@@ -620,6 +938,24 @@ async function main(): Promise<void> {
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
     },
+    sendVoice: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.sendVoice) {
+        logger.warn({ jid }, 'Channel does not support sendVoice');
+        return;
+      }
+      const { synthesizeSpeech } = await import('./image.js');
+      const audioPath = await synthesizeSpeech(text);
+      if (!audioPath) {
+        logger.warn({ jid }, 'TTS synthesis failed — voice message not sent');
+        return;
+      }
+      try {
+        await channel.sendVoice(jid, audioPath);
+      } finally {
+        import('fs').then((fsm) => fsm.default.unlink(audioPath, () => {}));
+      }
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {
@@ -641,11 +977,15 @@ async function main(): Promise<void> {
   });
 }
 
-// Guard: only run when executed directly, not when imported by tests
+// Guard: only run when executed directly, not when imported by tests.
+// NANOCLAW_MAIN=1 is set by the PM2 ecosystem config (PM2 sets process.argv[1] to
+// ProcessContainerFork.js, so argv comparison would never match).
+// The argv fallback handles direct `node dist/index.js` invocations.
 const isDirectRun =
-  process.argv[1] &&
-  new URL(import.meta.url).pathname ===
-    new URL(`file://${process.argv[1]}`).pathname;
+  !!process.env.NANOCLAW_MAIN ||
+  (process.argv[1] &&
+    path.resolve(fileURLToPath(import.meta.url)).toLowerCase() ===
+      path.resolve(process.argv[1]).toLowerCase());
 
 if (isDirectRun) {
   main().catch((err) => {

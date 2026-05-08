@@ -287,8 +287,13 @@ Rules:
     const sourceId = sourceResult.rows[0].id;
 
     const VALID_CATEGORIES = new Set([
-      'decision', 'preference', 'project_note', 'personal', 'research',
-      'problem_solved', 'problem',
+      'decision',
+      'preference',
+      'project_note',
+      'personal',
+      'research',
+      'problem_solved',
+      'problem',
     ]);
 
     for (const item of items) {
@@ -296,13 +301,15 @@ Rules:
       // Reject pipe-separated categories (model misread the prompt format)
       // and anything not in the known set — fall back to null rather than
       // polluting the category column with arbitrary strings.
-      const rawCategory = typeof item.category === 'string'
-        ? item.category.trim()
-        : null;
+      const rawCategory =
+        typeof item.category === 'string' ? item.category.trim() : null;
       const category =
         rawCategory && VALID_CATEGORIES.has(rawCategory) ? rawCategory : null;
       if (rawCategory && !category) {
-        logger.warn({ rawCategory }, 'extractAndStoreMemories: invalid category rejected');
+        logger.warn(
+          { rawCategory },
+          'extractAndStoreMemories: invalid category rejected',
+        );
       }
       const embedding = await embedText(item.content);
       const embeddingStr = embedding ? `[${embedding.join(',')}]` : null;
@@ -395,6 +402,26 @@ export async function fetchUnreadMessages(agentName: string): Promise<
   } catch (err) {
     logger.warn({ err }, 'fetchUnreadMessages failed — returning empty');
     return [];
+  }
+}
+
+/**
+ * Returns true if there is at least one unread wake-priority message for agentName.
+ * Does NOT mark messages as read — use fetchUnreadMessages to consume them.
+ */
+export async function hasUnreadWakeSignal(agentName: string): Promise<boolean> {
+  const p = getPool();
+  if (!p) return false;
+  try {
+    const result = await p.query(
+      `SELECT 1 FROM agent_messages
+       WHERE to_agent = $1 AND status = 'unread' AND priority = 'wake'
+       LIMIT 1`,
+      [agentName],
+    );
+    return result.rows.length > 0;
+  } catch {
+    return false;
   }
 }
 
