@@ -6,6 +6,7 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  ContainerConfig,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -74,7 +75,8 @@ function createSchema(database: Database.Database): void {
       session_id TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
-      jid TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      jid TEXT NOT NULL,
       name TEXT NOT NULL,
       folder TEXT NOT NULL UNIQUE,
       trigger_pattern TEXT NOT NULL,
@@ -82,6 +84,7 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jid_trigger ON registered_groups(jid, trigger_pattern);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -119,6 +122,23 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add backend and model_override columns (Phase 1: multi-backend support)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN backend TEXT DEFAULT 'anthropic'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN model_override TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
@@ -138,6 +158,48 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* columns already exist */
+  }
+
+  // Migrate registered_groups to support multiple registrations per JID (multi-bot support)
+  try {
+    // Check if the old schema exists (jid as PRIMARY KEY)
+    const tableInfo = database.pragma(
+      'table_info(registered_groups)',
+    ) as Array<{
+      name: string;
+      pk: number;
+    }>;
+    const hasPkOnJid = tableInfo.some(
+      (col) => col.name === 'jid' && col.pk === 1,
+    );
+
+    if (hasPkOnJid) {
+      logger.info('Migrating registered_groups schema for multi-bot support');
+      // Old schema detected — migrate to new schema
+      database.exec(`
+        CREATE TABLE registered_groups_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          jid TEXT NOT NULL,
+          name TEXT NOT NULL,
+          folder TEXT NOT NULL UNIQUE,
+          trigger_pattern TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          container_config TEXT,
+          requires_trigger INTEGER DEFAULT 1,
+          is_main INTEGER DEFAULT 0,
+          backend TEXT DEFAULT 'anthropic',
+          model_override TEXT
+        );
+        INSERT INTO registered_groups_new (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, backend, model_override)
+        SELECT jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, backend, model_override FROM registered_groups;
+        DROP TABLE registered_groups;
+        ALTER TABLE registered_groups_new RENAME TO registered_groups;
+        CREATE UNIQUE INDEX idx_jid_trigger ON registered_groups(jid, trigger_pattern);
+      `);
+      logger.info('Registered_groups migration complete');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'registered_groups migration failed or already done');
   }
 }
 
@@ -319,7 +381,8 @@ export function getNewMessages(
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
-        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND is_bot_message = 0
+        AND (is_from_me = 0 OR content NOT LIKE ?)
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT ?
@@ -352,7 +415,8 @@ export function getMessagesSince(
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
-        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND is_bot_message = 0
+        AND (is_from_me = 0 OR content NOT LIKE ?)
         AND content != '' AND content IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT ?
@@ -539,11 +603,16 @@ export function getAllSessions(): Record<string, string> {
 
 // --- Registered group accessors ---
 
+/**
+ * Get a single registered group by JID. For multi-bot setups (multiple registrations
+ * per JID), this returns the first match. Use getRegisteredGroupsByJid() to get all.
+ * @deprecated Use getRegisteredGroupsByJid() for multi-bot support
+ */
 export function getRegisteredGroup(
   jid: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
   const row = db
-    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
+    .prepare('SELECT * FROM registered_groups WHERE jid = ? LIMIT 1')
     .get(jid) as
     | {
         jid: string;
@@ -554,6 +623,8 @@ export function getRegisteredGroup(
         container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
+        backend: string | null;
+        model_override: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -576,26 +647,137 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    backend: (row.backend as 'anthropic' | 'openrouter') || 'anthropic',
+    modelOverride: row.model_override || undefined,
   };
+}
+
+/**
+ * Get all registered groups for a given JID (supports multi-bot per JID).
+ */
+export function getRegisteredGroupsByJid(
+  jid: string,
+): Array<RegisteredGroup & { jid: string }> {
+  const rows = db
+    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
+    .all(jid) as Array<{
+    jid: string;
+    name: string;
+    folder: string;
+    trigger_pattern: string;
+    added_at: string;
+    container_config: string | null;
+    requires_trigger: number | null;
+    is_main: number | null;
+    backend: string | null;
+    model_override: string | null;
+  }>;
+
+  return rows
+    .filter((row) => {
+      if (!isValidGroupFolder(row.folder)) {
+        logger.warn(
+          { jid: row.jid, folder: row.folder },
+          'Skipping registered group with invalid folder',
+        );
+        return false;
+      }
+      return true;
+    })
+    .map((row) => ({
+      jid: row.jid,
+      name: row.name,
+      folder: row.folder,
+      trigger: row.trigger_pattern,
+      added_at: row.added_at,
+      containerConfig: row.container_config
+        ? JSON.parse(row.container_config)
+        : undefined,
+      requiresTrigger:
+        row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+      isMain: row.is_main === 1 ? true : undefined,
+      backend: (row.backend as 'anthropic' | 'openrouter') || 'anthropic',
+      modelOverride: row.model_override || undefined,
+    }));
+}
+
+/**
+ * Match a message to the appropriate registered group based on trigger pattern.
+ * Returns the group whose trigger appears in the message content.
+ */
+export function matchRegisteredGroup(
+  jid: string,
+  messageContent: string,
+): (RegisteredGroup & { jid: string }) | undefined {
+  const groups = getRegisteredGroupsByJid(jid);
+  if (groups.length === 0) return undefined;
+  if (groups.length === 1) return groups[0];
+
+  // Multi-bot case: find which trigger pattern matches
+  const normalized = messageContent.trim();
+  for (const group of groups) {
+    // Match trigger at start of message (case-insensitive)
+    const triggerRegex = new RegExp(
+      `^${group.trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+      'i',
+    );
+    if (triggerRegex.test(normalized)) {
+      return group;
+    }
+  }
+
+  // No explicit trigger found — return undefined (message won't be processed)
+  return undefined;
 }
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   if (!isValidGroupFolder(group.folder)) {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
-  db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    jid,
-    group.name,
-    group.folder,
-    group.trigger,
-    group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
-    group.isMain ? 1 : 0,
-  );
+
+  // Check if this (jid, trigger_pattern) combo already exists
+  const existing = db
+    .prepare(
+      'SELECT id FROM registered_groups WHERE jid = ? AND trigger_pattern = ?',
+    )
+    .get(jid, group.trigger) as { id: number } | undefined;
+
+  if (existing) {
+    // Update existing registration
+    db.prepare(
+      `UPDATE registered_groups
+       SET name = ?, folder = ?, added_at = ?, container_config = ?,
+           requires_trigger = ?, is_main = ?, backend = ?, model_override = ?
+       WHERE id = ?`,
+    ).run(
+      group.name,
+      group.folder,
+      group.added_at,
+      group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+      group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+      group.isMain ? 1 : 0,
+      group.backend || 'anthropic',
+      group.modelOverride || null,
+      existing.id,
+    );
+  } else {
+    // Insert new registration
+    db.prepare(
+      `INSERT INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, backend, model_override)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      jid,
+      group.name,
+      group.folder,
+      group.trigger,
+      group.added_at,
+      group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+      group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+      group.isMain ? 1 : 0,
+      group.backend || 'anthropic',
+      group.modelOverride || null,
+    );
+  }
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
@@ -608,6 +790,8 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
+    backend: string | null;
+    model_override: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -618,6 +802,10 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       );
       continue;
     }
+    // For multi-bot support: only keep the first registration per JID in the legacy map
+    // (other code paths use getRegisteredGroupsByJid or matchRegisteredGroup directly)
+    if (result[row.jid]) continue;
+
     result[row.jid] = {
       name: row.name,
       folder: row.folder,
@@ -629,9 +817,64 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,
+      backend: (row.backend as 'anthropic' | 'openrouter') || 'anthropic',
+      modelOverride: row.model_override || undefined,
     };
   }
   return result;
+}
+
+/**
+ * Get all unique JIDs from registered groups (for multi-bot support)
+ */
+export function getAllRegisteredJids(): string[] {
+  const rows = db
+    .prepare('SELECT DISTINCT jid FROM registered_groups')
+    .all() as Array<{ jid: string }>;
+  return rows.map((r) => r.jid);
+}
+
+/**
+ * Get registered group by folder name (for queue processing after matchRegisteredGroup).
+ */
+export function getRegisteredGroupByFolder(
+  folder: string,
+): (RegisteredGroup & { jid: string }) | undefined {
+  const row = db
+    .prepare('SELECT * FROM registered_groups WHERE folder = ?')
+    .get(folder) as
+    | {
+        jid: string;
+        name: string;
+        folder: string;
+        trigger_pattern: string;
+        added_at: string;
+        container_config: string | null;
+        requires_trigger: number | null;
+        is_main: number | null;
+        backend: string | null;
+        model_override: string | null;
+      }
+    | undefined;
+
+  if (!row || !isValidGroupFolder(row.folder)) {
+    return undefined;
+  }
+
+  return {
+    jid: row.jid,
+    name: row.name,
+    folder: row.folder,
+    trigger: row.trigger_pattern,
+    added_at: row.added_at,
+    containerConfig: row.container_config
+      ? (JSON.parse(row.container_config) as ContainerConfig)
+      : undefined,
+    requiresTrigger: row.requires_trigger === 1,
+    isMain: row.is_main === 1,
+    backend: (row.backend || 'anthropic') as 'anthropic' | 'openrouter',
+    modelOverride: row.model_override || undefined,
+  };
 }
 
 // --- JSON migration ---

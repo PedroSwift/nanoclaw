@@ -40,6 +40,8 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  backend?: 'anthropic' | 'openrouter'; // Default: 'anthropic'
+  modelOverride?: string; // e.g. 'qwen/qwen3-235b-a22b' — null means use backend default
 }
 
 export interface NewMessage {
@@ -82,7 +84,7 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, folder?: string): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -90,6 +92,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: send a voice message (OGG/Opus audio file).
+  sendVoice?(jid: string, audioPath: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages
