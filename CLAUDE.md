@@ -1,64 +1,94 @@
-# NanoClaw
+# NanoClaw Project Context
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+This is a multi-channel agent orchestration system. Main work happens on 7dlearn.com (CFML/Lucee web platform).
 
-## Quick Context
+## Session Initialization
 
-Single Node.js process with skill-based channel system. Channels (WhatsApp, Telegram, Slack, Discord, Gmail) are skills that self-register at startup. Messages route to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+**CRITICAL - Load these at start of EVERY session:**
 
-## Key Files
+1. **Run snapshot** (if available):
+   ```bash
+   bash /c/SecondBrain/tools/snapshot.sh
+   ```
 
-| File | Purpose |
-|------|---------|
-| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/channels/registry.ts` | Channel registry (self-registration at startup) |
-| `src/ipc.ts` | IPC watcher and task processing |
-| `src/router.ts` | Message formatting and outbound routing |
-| `src/config.ts` | Trigger pattern, paths, intervals |
-| `src/container-runner.ts` | Spawns agent containers with mounts |
-| `src/task-scheduler.ts` | Runs scheduled tasks |
-| `src/db.ts` | SQLite operations |
-| `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
-| `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
+2. **Load behavioral instructions from Postgres**:
+   ```bash
+   docker exec second-brain-db psql -U peter -d secondbrain -c "SELECT content FROM memories WHERE category = 'feedback' ORDER BY captured_at DESC LIMIT 20;"
+   ```
+   
+   Key instructions to load:
+   - **Debugging methodology**: Pragmatic discovery, trace workflows, evidence before theory
+   - **No trailing summaries**: Peter can read the diff
+   - **Read files before editing**: Always understand before modifying
+   - **.md files are static only**: All history/state/context goes in Postgres
+   - **No secrets in commands**: Never grep/cat env vars or config on remote servers
+   - **Signal doubt early**: Flag constraints before iterating on fixes
+   - **Run save-session.mjs at end**: `node C:\SecondBrain\tools\save-session.mjs "summary"`
 
-## Skills
+3. **Check project state**:
+   ```bash
+   docker exec second-brain-db psql -U peter -d secondbrain -c "SELECT p.name, ps.section, ps.content FROM project_state ps JOIN projects p ON p.id=ps.project_id ORDER BY p.name, ps.section;"
+   ```
 
-| Skill | When to Use |
-|-------|-------------|
-| `/setup` | First-time installation, authentication, service configuration |
-| `/customize` | Adding channels, integrations, changing behavior |
-| `/debug` | Container issues, logs, troubleshooting |
-| `/update-nanoclaw` | Bring upstream NanoClaw updates into a customized install |
-| `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
-| `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
+4. **Check unread agent messages**:
+   ```bash
+   docker exec second-brain-db psql -U peter -d secondbrain -c "SELECT id, from_agent, subject, body FROM agent_messages WHERE to_agent = 'claude_code' AND status = 'unread' ORDER BY created_at ASC;"
+   ```
 
-## Development
+## Primary Projects
 
-Run commands directly—don't tell the user to run them.
+### 7D Learn (test.7dlearn.com, www.7dlearn.com)
+- **Stack**: Lucee 5.4 + Fusebox 5.5 + PostgreSQL
+- **SSH**: `7d-prod` (both test and prod on same server)
+- **Test webroot**: `/var/www/test.7dlearn.com/`
+- **Prod webroot**: `/var/www/www.7dlearn.com/`
+- **Test URL**: `https://test.7dlearn.com/` (HTTP Basic Auth: peter / \IdLOAAfme9#{6*9([' )
+- **Deploy**: Work in test, pull to prod when ready
+- **Framework notes**: Fusebox circuit-based routing, circuit.xml.cfm files
+
+### NanoClaw (this repo)
+- Telegram channel active (not WhatsApp)
+- Multi-bot support with isolated contexts
+- Container-based agent execution
+
+## Key Commands
 
 ```bash
-npm run dev          # Run with hot reload
-npm run build        # Compile TypeScript
-./container/build.sh # Rebuild agent container
+# 7dlearn - restart Lucee after code changes
+ssh 7d-prod "sudo systemctl restart lucee_tomcat"
+
+# 7dlearn - check logs
+ssh 7d-prod "tail -100 /var/www/test.7dlearn.com/WEB-INF/lucee/logs/application.log"
+ssh 7d-prod "tail -100 /var/www/test.7dlearn.com/WEB-INF/lucee/logs/exception.log"
+ssh 7d-prod "tail -100 /var/www/test.7dlearn.com/WEB-INF/lucee/logs/routing.log"
+
+# NanoClaw - check status
+pm2 status
+pm2 logs nanoclaw --lines 50
 ```
 
-Service management:
-```bash
-# macOS (launchd)
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # restart
+## Memory System
 
-# Linux (systemd)
-systemctl --user start nanoclaw
-systemctl --user stop nanoclaw
-systemctl --user restart nanoclaw
+**All persistent memory goes in Postgres `memories` table:**
+- Categories: `project:7dlearn`, `project:nanoclaw`, `project:second_brain`, `feedback`, `user`
+- Query: `docker exec second-brain-db psql -U peter -d secondbrain`
+- **Never write history, state, or context to .md files** - they are for static instructions only
+
+## Git Workflow
+
+Always commit changes with descriptive messages. Include co-author:
+```
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
 ```
 
 ## Troubleshooting
 
-**WhatsApp not connecting after upgrade:** WhatsApp is now a separate channel fork, not bundled in core. Run `/add-whatsapp` (or `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git && git fetch whatsapp main && (git merge whatsapp/main || { git checkout --theirs package-lock.json && git add package-lock.json && git merge --continue; }) && npm run build`) to install it. Existing auth credentials and groups are preserved.
+**7dlearn common issues:**
+- After Lucee restart: visit `?reinit=1` to reinitialize Application.cfc
+- After code changes: restart Lucee service
+- Fusebox circuits cached: may need Lucee restart to pick up changes
+- Session issues: check routing.log for SESSIONAUTHENTICATED status
 
-## Container Build Cache
-
-The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
+**NanoClaw:**
+- PM2 restarts lose in-flight container output (Docker instability)
+- IPC file-based sends survive restarts, marker-based text doesn't
