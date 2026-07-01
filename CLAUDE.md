@@ -43,8 +43,36 @@ This is a multi-channel agent orchestration system. Main work happens on 7dlearn
 - **Test webroot**: `/var/www/test.7dlearn.com/`
 - **Prod webroot**: `/var/www/www.7dlearn.com/`
 - **Test URL**: `https://test.7dlearn.com/` (HTTP Basic Auth: peter / \IdLOAAfme9#{6*9([' )
-- **Deploy**: Work in test, pull to prod when ready
 - **Framework notes**: Fusebox circuit-based routing, circuit.xml.cfm files
+
+#### CRITICAL: 7dlearn Deployment Workflow
+
+**NEVER use `git add .` or `git add -A` — always name files explicitly**
+**NEVER use git pull/reset on www.7dlearn.com — rsync only**
+**NEVER declare deployment done without running diff verification**
+
+**Step 1 — Commit on test (explicit adds only):**
+```bash
+git -C /var/www/test.7dlearn.com add <specific files only>
+git -C /var/www/test.7dlearn.com commit -m "message"
+git -C /var/www/test.7dlearn.com push origin main
+```
+
+**Step 2 — Deploy to www via rsync:**
+```bash
+sudo rsync -av --exclude='.git' --exclude='WEB-INF' \
+  /var/www/test.7dlearn.com/ /var/www/www.7dlearn.com/
+```
+
+**Step 3 — Verify parity (MANDATORY):**
+```bash
+diff -rq --exclude='.git' --exclude='WEB-INF' \
+  /var/www/test.7dlearn.com/ /var/www/www.7dlearn.com/ \
+  2>/dev/null | grep -v '\.log' | grep -v 'parsed/'
+```
+Must produce no output (or only expected test-only files). If .cfm or .cfc diffs appear, deployment is NOT complete.
+
+**Why:** WEB-INF/ is owned by Lucee (different OS user). Using `git add .` commits WEB-INF/, causing Permission Denied on all future git operations. Git pull on www has repeatedly left www 6+ commits behind without detection.
 
 ### NanoClaw (this repo)
 - Telegram channel active (not WhatsApp)
