@@ -88,9 +88,24 @@ function saveSessionHistory(
   messages: ChatCompletionMessageParam[],
 ): void {
   // Filter out invalid messages: assistant messages with null content are incomplete/failed responses
+  // Also filter out orphaned tool messages (tool messages whose assistant message was filtered)
+  const toolCallIdsToRemove = new Set<string>();
+
+  // First pass: identify tool_call_ids from assistant messages we're removing
+  messages.forEach((msg) => {
+    if (msg.role === 'assistant' && msg.content === null && msg.tool_calls) {
+      msg.tool_calls.forEach((tc) => toolCallIdsToRemove.add(tc.id));
+      log(`WARNING: Removing assistant message with null content and its tool calls`);
+    }
+  });
+
+  // Second pass: filter out invalid assistant messages and orphaned tool messages
   const validMessages = messages.filter((msg) => {
     if (msg.role === 'assistant' && msg.content === null) {
-      log(`WARNING: Skipping save of assistant message with null content (incomplete response)`);
+      return false;
+    }
+    if (msg.role === 'tool' && toolCallIdsToRemove.has((msg as any).tool_call_id)) {
+      log(`WARNING: Removing orphaned tool message (tool_call_id: ${(msg as any).tool_call_id})`);
       return false;
     }
     return true;
@@ -133,18 +148,24 @@ function loadClaudeMdFiles(): string {
 }
 
 /**
- * Bash tool: restricted to psql and curl to internal services only
+ * Bash tool: standard read-only filesystem commands allowed
  */
 async function executeBash(command: string): Promise<string> {
   const trimmed = command.trim();
 
-  // Whitelist: only psql and curl to host.docker.internal
-  const allowed =
-    trimmed.startsWith('psql ') ||
-    trimmed.startsWith('curl http://host.docker.internal:');
+  // Whitelist: common safe commands for file operations, database, and HTTP
+  const allowedCommands = [
+    'ls', 'cat', 'head', 'tail', 'grep', 'find', 'wc', 'sort', 'uniq',
+    'psql', 'curl', 'wget', 'git', 'npm', 'node', 'pwd', 'echo', 'date',
+    'rm', 'mkdir', 'mv', 'cp', 'touch'
+  ];
+
+  const firstToken = trimmed.split(/\s+/)[0];
+  const allowed = allowedCommands.includes(firstToken) ||
+                  trimmed.startsWith('curl http://host.docker.internal:');
 
   if (!allowed) {
-    return 'ERROR: Command not permitted. Only psql and curl http://host.docker.internal:... are allowed.';
+    return `ERROR: Command not permitted. Allowed: ${allowedCommands.join(', ')}`;
   }
 
   const { execSync } = await import('child_process');
@@ -267,6 +288,79 @@ async function scheduleTask(
 }
 
 /**
+ * Store memory via IPC bridge
+ */
+async function storeMemory(
+  content: string,
+  category: string,
+  groupFolder: string,
+): Promise<string> {
+  const ipcDir = '/workspace/ipc/tasks';
+  fs.mkdirSync(ipcDir, { recursive: true });
+  const msgFile = path.join(ipcDir, `${Date.now()}.json`);
+
+  // Determine agent name from group folder
+  let agentName = 'savio'; // default
+  if (groupFolder.includes('telegram_raine')) {
+    agentName = 'raine';
+  } else if (groupFolder.includes('telegram_savio')) {
+    agentName = 'savio';
+  }
+
+  const payload = {
+    type: 'store_memory',
+    content,
+    category,
+    agent: agentName,
+  };
+
+  fs.writeFileSync(msgFile, JSON.stringify(payload));
+  log(`store_memory IPC: agent=${agentName}, category=${category}, groupFolder=${groupFolder}`);
+
+  return `Memory stored in category: ${category} for agent: ${agentName}`;
+}
+
+/**
+ * Fetch memories via direct database query
+ */
+async function fetchMemory(
+  query?: string,
+  category?: string,
+  limit: number = 10,
+  groupFolder: string = '',
+): Promise<string> {
+  // Determine agent name from group folder
+  let agentName = 'savio';
+  if (groupFolder.includes('telegram_raine')) {
+    agentName = 'raine';
+  } else if (groupFolder.includes('telegram_savio')) {
+    agentName = 'savio';
+  }
+
+  const { execSync } = await import('child_process');
+  try {
+    let sql = `SELECT id, LEFT(content, 200) as content_preview, category, captured_at FROM memories WHERE agent = '${agentName}'`;
+
+    if (category) {
+      sql += ` AND category = '${category}'`;
+    }
+    if (query) {
+      sql += ` AND content ILIKE '%${query}%'`;
+    }
+
+    sql += ` ORDER BY captured_at DESC LIMIT ${limit}`;
+
+    const output = execSync(`psql "$SECOND_BRAIN_DB_URL" -c "${sql}"`, {
+      encoding: 'utf-8',
+      timeout: 10000,
+    });
+    return output;
+  } catch (err: any) {
+    return `ERROR: ${err.message}`;
+  }
+}
+
+/**
  * Tool definitions for OpenAI
  */
 function getTools(containerInput: ContainerInput): ChatCompletionTool[] {
@@ -376,6 +470,49 @@ function getTools(containerInput: ContainerInput): ChatCompletionTool[] {
         },
       },
     },
+    {
+      type: 'function',
+      function: {
+        name: 'store_memory',
+        description: 'Store a memory in the Second Brain database for future recall',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: { type: 'string', description: 'The memory content to store' },
+            category: {
+              type: 'string',
+              description: 'Memory category (e.g., user, feedback, project:name)',
+            },
+          },
+          required: ['content', 'category'],
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'fetch_memory',
+        description: 'Fetch memories from the Second Brain database. Returns up to 10 recent memories by default.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Optional search query to filter memory content',
+            },
+            category: {
+              type: 'string',
+              description: 'Optional category filter (e.g., user, feedback, project:name)',
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of memories to return (default 10, max 50)',
+            },
+          },
+          required: [],
+        },
+      },
+    },
   ];
 }
 
@@ -411,6 +548,15 @@ async function executeTool(
         containerInput.groupFolder,
         containerInput.chatJid,
       );
+    case 'store_memory':
+      return storeMemory(args.content, args.category, containerInput.groupFolder);
+    case 'fetch_memory':
+      return fetchMemory(
+        args.query,
+        args.category,
+        args.limit || 10,
+        containerInput.groupFolder,
+      );
     default:
       return `ERROR: Unknown tool: ${toolName}`;
   }
@@ -442,6 +588,8 @@ async function runAgent(containerInput: ContainerInput): Promise<void> {
   const client = new OpenAI({
     apiKey,
     baseURL: 'https://openrouter.ai/api/v1',
+    timeout: 120000, // 2 minutes timeout for OpenRouter API calls
+    maxRetries: 2,
   });
 
   // Load session history
@@ -474,7 +622,9 @@ async function runAgent(containerInput: ContainerInput): Promise<void> {
 
   const tools = getTools(containerInput);
   let iterationCount = 0;
-  const MAX_ITERATIONS = 20;
+  const MAX_ITERATIONS = 10; // Lowered from 20 to prevent excessive looping
+  let consecutiveErrors = 0;
+  let consecutiveToolCalls = 0; // Track consecutive tool calls without text response
 
   while (iterationCount < MAX_ITERATIONS) {
     iterationCount++;
@@ -482,12 +632,53 @@ async function runAgent(containerInput: ContainerInput): Promise<void> {
       `Iteration ${iterationCount}: ${messages.length} messages in history`,
     );
 
-    const completion = await client.chat.completions.create({
-      model,
-      messages,
-      tools,
-      temperature: 0.7,
-    });
+    let completion;
+    try {
+      completion = await client.chat.completions.create({
+        model,
+        messages,
+        tools,
+        temperature: 0.7,
+      });
+      consecutiveErrors = 0; // Reset on success
+    } catch (err: any) {
+      consecutiveErrors++;
+      log(`API error (attempt ${consecutiveErrors}): ${err.message}`);
+      log(`Full error: ${JSON.stringify(err, null, 2)}`);
+
+      // On repeated 400 errors, clear history and retry with just the current prompt
+      if (err.status === 400 && consecutiveErrors >= 2) {
+        log('Clearing session history due to repeated 400 errors');
+        const systemMsg = messages.find(m => m.role === 'system');
+        const userMsg = messages[messages.length - 1];
+        messages = systemMsg ? [systemMsg, userMsg] : [userMsg];
+
+        // Try one more time with clean history
+        try {
+          completion = await client.chat.completions.create({
+            model,
+            messages,
+            tools,
+            temperature: 0.7,
+          });
+          consecutiveErrors = 0;
+        } catch (retryErr: any) {
+          writeOutput({
+            status: 'error',
+            result: null,
+            error: `API error after history cleanup: ${retryErr.message}`,
+          });
+          return;
+        }
+      } else {
+        writeOutput({
+          status: 'error',
+          result: null,
+          error: `API error: ${err.message}`,
+        });
+        return;
+      }
+    }
 
     const choice = completion.choices[0];
     if (!choice) {
@@ -504,9 +695,15 @@ async function runAgent(containerInput: ContainerInput): Promise<void> {
 
     // Check for tool calls
     if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      consecutiveToolCalls++;
       log(
-        `Model requested ${assistantMessage.tool_calls.length} tool call(s)`,
+        `Model requested ${assistantMessage.tool_calls.length} tool call(s) (consecutive: ${consecutiveToolCalls})`,
       );
+
+      // If model has made 6+ consecutive tool calls without responding, inject a prompt
+      if (consecutiveToolCalls >= 6) {
+        log('WARNING: 6+ consecutive tool calls - will inject response prompt after this iteration');
+      }
 
       for (const toolCall of assistantMessage.tool_calls) {
         const toolName = toolCall.function.name;
@@ -528,11 +725,21 @@ async function runAgent(containerInput: ContainerInput): Promise<void> {
         messages.push(toolMessage);
       }
 
+      // After 6+ consecutive tool calls, inject a prompt to force a response
+      if (consecutiveToolCalls >= 6) {
+        messages.push({
+          role: 'user',
+          content: 'Please provide a summary response to the user based on the tool results above. Do not make more tool calls.',
+        });
+        log('Injected response prompt to break tool-calling loop');
+      }
+
       // Continue loop to get next model response
       continue;
     }
 
-    // No tool calls — final response
+    // No tool calls — final response (reset counter)
+    consecutiveToolCalls = 0;
     const finalText = assistantMessage.content || '';
     const strippedText = stripInternalTags(finalText);
 
